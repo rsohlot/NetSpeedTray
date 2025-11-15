@@ -245,6 +245,7 @@ def get_total_bandwidth_for_period(db_path: Union[str, Path], start_time: Option
     """
     Calculates total bandwidth by running SUM queries across all relevant tables.
     Uses a separate, read-only connection for thread safety.
+    Uses parameterized queries to prevent SQL injection.
     """
     logger = logging.getLogger("NetSpeedTray.db_utils")
     total_up, total_down = 0.0, 0.0
@@ -264,9 +265,11 @@ def get_total_bandwidth_for_period(db_path: Union[str, Path], start_time: Option
         }
 
         for table, (up_sum_expr, down_sum_expr) in table_map.items():
+            # Build query with parameterized placeholders
             query = f"SELECT {up_sum_expr}, {down_sum_expr} FROM {table} WHERE timestamp BETWEEN ? AND ?"
             params: List[Any] = [_start_ts, _end_ts]
 
+            # Add interface filter with parameterization (already secure, just improving clarity)
             if interface_name and interface_name != "All":
                 query += " AND interface_name = ?"
                 params.append(interface_name)
@@ -442,23 +445,34 @@ def get_app_bandwidth_usage(db_path: Union[str, Path], start_time: Optional[date
 
     results: List[AppBandwidthData] = []
     start_timestamp = int(start_time.timestamp()) if start_time else None
-    interface_filter = " AND interface IN ({})".format(
-        ",".join([f"'{i}'" for i in interfaces]) if interfaces else "'*'"
-    ) if interfaces else ""
-    app_filter = " AND app_name IN ({})".format(
-        ",".join([f"'{a}'" for a in app_names]) if app_names else "'*'"
-    ) if app_names else ""
-
-    query = f"""
-        SELECT app_name, timestamp, bytes_sent, bytes_recv, interface
-        FROM {constants.data.APP_BANDWIDTH_TABLE}
-        WHERE deleted_at IS NULL
-        {interface_filter}
-        {app_filter}
-        {"AND timestamp >= ?" if start_timestamp else ""}
-        ORDER BY timestamp DESC
-    """
-    params = [start_timestamp] if start_timestamp else []
+    
+    # Build query with parameterized placeholders to prevent SQL injection
+    query_parts = [
+        f"SELECT app_name, timestamp, bytes_sent, bytes_recv, interface",
+        f"FROM {constants.data.APP_BANDWIDTH_TABLE}",
+        "WHERE deleted_at IS NULL"
+    ]
+    params = []
+    
+    # Add interface filter with proper parameterization
+    if interfaces:
+        placeholders = ", ".join("?" for _ in interfaces)
+        query_parts.append(f"AND interface IN ({placeholders})")
+        params.extend(interfaces)
+    
+    # Add app_name filter with proper parameterization
+    if app_names:
+        placeholders = ", ".join("?" for _ in app_names)
+        query_parts.append(f"AND app_name IN ({placeholders})")
+        params.extend(app_names)
+    
+    # Add timestamp filter
+    if start_timestamp:
+        query_parts.append("AND timestamp >= ?")
+        params.append(start_timestamp)
+    
+    query_parts.append("ORDER BY timestamp DESC")
+    query = " ".join(query_parts)
 
     try:
         with db_lock, sqlite3.connect(db_path, timeout=10) as conn:
