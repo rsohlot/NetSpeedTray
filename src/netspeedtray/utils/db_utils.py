@@ -21,6 +21,7 @@ import logging
 import os
 import sqlite3
 import threading
+import hashlib
 from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
@@ -35,12 +36,230 @@ SpeedData = namedtuple("SpeedData", ["timestamp", "upload", "download", "interfa
 AppBandwidthData = namedtuple("AppBandwidthData", ["app_name", "timestamp", "bytes_sent", "bytes_recv", "interface"])
 
 
+# --- Input Validation Functions ---
+def validate_interface_name(interface_name: str) -> bool:
+    """
+    Validate network interface name to prevent malicious input.
+    
+    Args:
+        interface_name: The interface name to validate
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    if not interface_name or not isinstance(interface_name, str):
+        return False
+    
+    # Check length (reasonable max for interface names)
+    if len(interface_name) > 256:
+        return False
+    
+    # Check for SQL injection patterns (additional safety layer)
+    dangerous_patterns = ["'", '"', ';', '--', '/*', '*/', 'DROP', 'DELETE', 'UPDATE', 'INSERT', 'UNION']
+    interface_upper = interface_name.upper()
+    for pattern in dangerous_patterns:
+        if pattern in interface_upper:
+            return False
+    
+    # Check for null bytes and control characters
+    if '\x00' in interface_name or any(ord(c) < 32 for c in interface_name if c not in ['\t', '\n', '\r']):
+        return False
+    
+    return True
+
+
+def validate_app_name(app_name: str) -> bool:
+    """
+    Validate application name to prevent malicious input.
+    
+    Args:
+        app_name: The application name to validate
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    if not app_name or not isinstance(app_name, str):
+        return False
+    
+    # Check length (reasonable max for app names)
+    if len(app_name) > 512:
+        return False
+    
+    # Check for SQL injection patterns
+    dangerous_patterns = ["'", '"', ';', '--', '/*', '*/', 'DROP', 'DELETE', 'UPDATE', 'INSERT', 'UNION']
+    app_upper = app_name.upper()
+    for pattern in dangerous_patterns:
+        if pattern in app_upper:
+            return False
+    
+    # Check for null bytes and control characters
+    if '\x00' in app_name or any(ord(c) < 32 for c in app_name if c not in ['\t', '\n', '\r']):
+        return False
+    
+    return True
+
+
+def sanitize_interface_list(interfaces: Optional[List[str]]) -> List[str]:
+    """
+    Sanitize and validate a list of interface names.
+    
+    Args:
+        interfaces: List of interface names to sanitize
+        
+    Returns:
+        List of valid interface names (invalid ones are filtered out)
+    """
+    if not interfaces:
+        return []
+    
+    logger = logging.getLogger("NetSpeedTray.db_utils")
+    sanitized = []
+    
+    for interface in interfaces:
+        if validate_interface_name(interface):
+            sanitized.append(interface)
+        else:
+            logger.warning("Invalid interface name filtered out: %s", repr(interface))
+    
+    return sanitized
+
+
+def sanitize_app_list(app_names: Optional[List[str]]) -> List[str]:
+    """
+    Sanitize and validate a list of application names.
+    
+    Args:
+        app_names: List of app names to sanitize
+        
+    Returns:
+        List of valid app names (invalid ones are filtered out)
+    """
+    if not app_names:
+        return []
+    
+    logger = logging.getLogger("NetSpeedTray.db_utils")
+    sanitized = []
+    
+    for app_name in app_names:
+        if validate_app_name(app_name):
+            sanitized.append(app_name)
+        else:
+            logger.warning("Invalid app name filtered out: %s", repr(app_name))
+    
+    return sanitized
+
+
+def verify_database_integrity(db_path: Union[str, Path]) -> Tuple[bool, str]:
+    """
+    Verify the integrity of the SQLite database.
+    
+    Args:
+        db_path: Path to the database file
+        
+    Returns:
+        Tuple of (is_valid, error_message). error_message is empty string if valid.
+    """
+    logger = logging.getLogger("NetSpeedTray.db_utils")
+    
+    try:
+        # Check if file exists
+        if not os.path.exists(db_path):
+            return False, "Database file does not exist"
+        
+        # Check file size is reasonable (not too small, not impossibly large)
+        file_size = os.path.getsize(db_path)
+        if file_size < 100:  # SQLite header is at least 100 bytes
+            return False, f"Database file too small ({file_size} bytes)"
+        
+        # 10 GB maximum (reasonable for network monitoring app)
+        if file_size > 10 * 1024 * 1024 * 1024:
+            logger.warning("Database file is very large (%d bytes)", file_size)
+        
+        # Open database and run integrity check
+        with sqlite3.connect(db_path, timeout=10) as conn:
+            cursor = conn.cursor()
+            
+            # SQLite's built-in integrity check
+            cursor.execute("PRAGMA integrity_check")
+            result = cursor.fetchone()
+            
+            if result and result[0] != "ok":
+                return False, f"Database integrity check failed: {result[0]}"
+            
+            # Check that required tables exist
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {row[0] for row in cursor.fetchall()}
+            
+            required_tables = {
+                constants.data.SPEED_TABLE,
+                constants.data.AGGREGATED_TABLE,
+                constants.data.BANDWIDTH_TABLE,
+                constants.data.APP_BANDWIDTH_TABLE
+            }
+            
+            missing_tables = required_tables - tables
+            if missing_tables:
+                return False, f"Missing required tables: {', '.join(missing_tables)}"
+            
+            logger.debug("Database integrity verified successfully")
+            return True, ""
+            
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
+    except Exception as e:
+        return False, f"Unexpected error: {e}"
+
+
+def calculate_database_checksum(db_path: Union[str, Path]) -> Optional[str]:
+    """
+    Calculate SHA-256 checksum of the database file.
+    
+    Args:
+        db_path: Path to the database file
+        
+    Returns:
+        Hex string of the checksum, or None if error
+    """
+    logger = logging.getLogger("NetSpeedTray.db_utils")
+    
+    try:
+        sha256_hash = hashlib.sha256()
+        with open(db_path, "rb") as f:
+            # Read in chunks to handle large files
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        
+        checksum = sha256_hash.hexdigest()
+        logger.debug("Database checksum calculated: %s", checksum[:16] + "...")
+        return checksum
+        
+    except Exception as e:
+        logger.error("Failed to calculate database checksum: %s", e)
+        return None
+
+
 def init_database(db_path: Union[str, Path]) -> None:
     """
     Initialize the SQLite database with required tables and indices.
+    Also performs integrity verification if database already exists.
     """
     logger = logging.getLogger("NetSpeedTray.db_utils")
     logger.debug("Initializing database at %s", db_path)
+    
+    # Verify existing database integrity
+    if os.path.exists(db_path):
+        is_valid, error_msg = verify_database_integrity(db_path)
+        if not is_valid:
+            logger.error("Existing database failed integrity check: %s", error_msg)
+            # Backup corrupted database
+            backup_path = f"{db_path}.corrupted.{int(datetime.now().timestamp())}"
+            try:
+                os.rename(db_path, backup_path)
+                logger.warning("Corrupted database backed up to: %s", backup_path)
+            except Exception as e:
+                logger.error("Failed to backup corrupted database: %s", e)
+                raise RuntimeError(f"Database is corrupted and cannot be backed up: {error_msg}") from e
+    
     try:
         with sqlite3.connect(db_path, timeout=10) as conn:
             cursor = conn.cursor()
@@ -296,6 +515,9 @@ def get_max_speeds(db_path: Union[str, Path], start_time: Optional[int] = None, 
     logger = logging.getLogger("NetSpeedTray.db_utils")
     logger.debug("Fetching max speeds with start_time=%s, interfaces=%s", start_time, interfaces)
 
+    # Sanitize interface names
+    sanitized_interfaces = sanitize_interface_list(interfaces)
+
     query_parts = [
         "SELECT MAX(max_upload), MAX(max_download) FROM (",
         f"SELECT MAX(upload) as max_upload, MAX(download) as max_download FROM {constants.data.SPEED_TABLE} WHERE deleted_at IS NULL",
@@ -309,10 +531,10 @@ def get_max_speeds(db_path: Union[str, Path], start_time: Optional[int] = None, 
     if start_time:
         where_clauses.append("timestamp >= ?")
         params.append(start_time)
-    if interfaces:
-        placeholders = ", ".join("?" for _ in interfaces)
+    if sanitized_interfaces:
+        placeholders = ", ".join("?" for _ in sanitized_interfaces)
         where_clauses.append(f"interface IN ({placeholders})")
-        params.extend(interfaces)
+        params.extend(sanitized_interfaces)
 
     if where_clauses:
         # This is a bit complex, but it correctly applies the WHERE to both subqueries
@@ -396,16 +618,19 @@ def get_bandwidth_usage(db_path: Union[str, Path], start_time: Optional[int] = N
     logger = logging.getLogger("NetSpeedTray.db_utils")
     logger.debug("Fetching bandwidth usage with start_time=%s, interfaces=%s", start_time, interfaces)
     
+    # Sanitize interface names
+    sanitized_interfaces = sanitize_interface_list(interfaces)
+    
     query_parts = [f"SELECT SUM(bytes_sent), SUM(bytes_recv) FROM {constants.data.BANDWIDTH_TABLE} WHERE deleted_at IS NULL"]
     params = []
 
     if start_time:
         query_parts.append("AND timestamp >= ?")
         params.append(start_time)
-    if interfaces:
-        placeholders = ", ".join("?" for _ in interfaces)
+    if sanitized_interfaces:
+        placeholders = ", ".join("?" for _ in sanitized_interfaces)
         query_parts.append(f"AND interface IN ({placeholders})")
-        params.extend(interfaces)
+        params.extend(sanitized_interfaces)
     
     query = " ".join(query_parts)
 
@@ -446,6 +671,10 @@ def get_app_bandwidth_usage(db_path: Union[str, Path], start_time: Optional[date
     results: List[AppBandwidthData] = []
     start_timestamp = int(start_time.timestamp()) if start_time else None
     
+    # Sanitize inputs to prevent malicious data
+    sanitized_interfaces = sanitize_interface_list(interfaces)
+    sanitized_app_names = sanitize_app_list(app_names)
+    
     # Build query with parameterized placeholders to prevent SQL injection
     query_parts = [
         f"SELECT app_name, timestamp, bytes_sent, bytes_recv, interface",
@@ -455,16 +684,16 @@ def get_app_bandwidth_usage(db_path: Union[str, Path], start_time: Optional[date
     params = []
     
     # Add interface filter with proper parameterization
-    if interfaces:
-        placeholders = ", ".join("?" for _ in interfaces)
+    if sanitized_interfaces:
+        placeholders = ", ".join("?" for _ in sanitized_interfaces)
         query_parts.append(f"AND interface IN ({placeholders})")
-        params.extend(interfaces)
+        params.extend(sanitized_interfaces)
     
     # Add app_name filter with proper parameterization
-    if app_names:
-        placeholders = ", ".join("?" for _ in app_names)
+    if sanitized_app_names:
+        placeholders = ", ".join("?" for _ in sanitized_app_names)
         query_parts.append(f"AND app_name IN ({placeholders})")
-        params.extend(app_names)
+        params.extend(sanitized_app_names)
     
     # Add timestamp filter
     if start_timestamp:
